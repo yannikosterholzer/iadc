@@ -6,8 +6,8 @@ module error_handler #(
     parameter int          CRITICAL_RANGE       = 100,
     parameter int          FULL_SCALE_HI        = 900,
     parameter int          CLIP_VAL             = 1023,
-    parameter int          OUTLIER_THRESH_CRIT  = 100,
-    parameter int          OUTLIER_THRESH_NORM  = 150,
+    parameter int          OUTLIER_THRESH_CRIT  = 128,
+    parameter int          OUTLIER_THRESH_NORM  = 512,
     parameter int unsigned PIPE_LATENCY         = 3     // clocks from pulse-in to pulse-out
 ) (
     input  logic                clk,
