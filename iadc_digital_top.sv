@@ -8,11 +8,11 @@ module iadc_digital_top #(
     parameter int unsigned DELTA_HIST          = 4,
     parameter int unsigned DELTA_SHIFT         = 2,
     parameter int unsigned WARMUP_SAMPLES      = 4,
-    parameter int          CRITICAL_RANGE      = 50,
+    parameter int          CRITICAL_RANGE      = 128,
     parameter int          FULL_SCALE_HI       = 900,
     parameter int          CLIP_VAL            = 1023,
     parameter int          OUTLIER_THRESH_CRIT = 100,
-    parameter int          OUTLIER_THRESH_NORM = 150,
+    parameter int          OUTLIER_THRESH_NORM = 512,
     parameter int unsigned PIPE_LATENCY        = 3
 ) (
     input  logic       clk,
