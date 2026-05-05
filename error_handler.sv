@@ -12,7 +12,7 @@ module error_handler #(
     input  logic  [9:0]         cnt_in,          // deint counter magnitude
     input  logic                sgn_in,          // sign bit (0 = pos, 1 = neg)
     input  logic                ovf_in,          // input overflow flag
-    output logic                clk_out,      // valid pulse delayed by PIPE_LATENCY
+    output logic                clk_out,         // valid pulse delayed by PIPE_LATENCY
     output logic  [9:0]         dout,            // corrected magnitude
     output logic                dout_sgn,        // corrected sign bit
     output logic                flag_estimated   // 1 = value was corrected, 0 = measured
