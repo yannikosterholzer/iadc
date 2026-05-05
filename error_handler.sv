@@ -1,304 +1,207 @@
 module error_handler #(
-    parameter int unsigned BUF_LEN              = 5,    // 5 entries
-    parameter int unsigned DELTA_HIST           = 4,    // must be power of 2
-    parameter int unsigned DELTA_SHIFT          = 2,    // log2(DELTA_HIST)
-    parameter int unsigned WARMUP_SAMPLES       = 4,
-    parameter int          CRITICAL_RANGE       = 100,
-    parameter int          FULL_SCALE_HI        = 900,
-    parameter int          CLIP_VAL             = 1023,
-    parameter int          OUTLIER_THRESH_CRIT  = 128,
-    parameter int          OUTLIER_THRESH_NORM  = 512,
-    parameter int unsigned PIPE_LATENCY         = 3     // clocks from pulse-in to pulse-out
+    parameter int unsigned BUF_LEN              = 4,    // FIFO depth
+    parameter int unsigned DELTA_SHIFT          = 2,    // log2 of delta-divisor
+    parameter int          CRITICAL_RANGE       = 100,  // |expected| < this => critical zone
+    parameter int          OUTLIER_THRESH       = 128,  // |v_meas - expected| > this => outlier
+    parameter int          CLIP_VAL             = 1023, // value substituted on input overflow
+    parameter int unsigned PIPE_LATENCY         = 2     // clocks from sample_pulse to clk_out
 ) (
     input  logic                clk,
-    input  logic                resetn,          
-    input  logic                pwrdn,           // synchronous power-down (already synchronized in toplevel)
+    input  logic                resetn,
     input  logic                sample_pulse,    // level pulse marking valid input window
     input  logic  [9:0]         cnt_in,          // deint counter magnitude
-    input  logic                sgn_in,          // sign bit (0=pos, 1=neg)
-    input  logic                ovf_in,          // overflow flag
-    output logic                dout_pulse,      // dout valid-pulse delayed by PIPE_LATENCY
+    input  logic                sgn_in,          // sign bit (0 = pos, 1 = neg)
+    input  logic                ovf_in,          // input overflow flag
+    output logic                clk_out,      // valid pulse delayed by PIPE_LATENCY
     output logic  [9:0]         dout,            // corrected magnitude
     output logic                dout_sgn,        // corrected sign bit
-    output logic                flag_estimated   // 1 = value corrected, 0 = measured
+    output logic                flag_estimated   // 1 = value was corrected, 0 = measured
 );
+
+    typedef logic signed [11:0] sval_t;          // internal 12-bit signed datum
 
     typedef enum logic {
         MEASURED  = 1'b0,
         ESTIMATED = 1'b1
     } flag_e;
 
-    typedef enum logic {
-        WARMUP  = 1'b0,
-        RUNNING = 1'b1
-    } warmup_state_e;
-
-    typedef logic signed [11:0] sval_t;
-
     typedef struct packed {
         sval_t  value;
         flag_e  flag;
     } buf_entry_t;
 
-    typedef enum logic [1:0] {
-        SEQ_IDLE  = 2'b00,
-        SEQ_BUSY  = 2'b01,
-        SEQ_HOLD  = 2'b10
-    } seq_state_e;
 
-    seq_state_e  seq_state, seq_next;
-    logic        seq_start;
+    typedef enum logic [2:0] {
+        S_IDLE_WARM   = 3'b000,
+        S_CALC_WARM   = 3'b010,
+        S_COMMIT_WARM = 3'b100,
+        S_HOLD_WARM   = 3'b110,
+        S_IDLE_RUN    = 3'b001,
+        S_CALC_RUN    = 3'b011,
+        S_COMMIT_RUN  = 3'b101,
+        S_HOLD_RUN    = 3'b111
+    } state_e;
 
-    always_ff @(posedge clk or negedge resetn) begin : SEQ_REG
-        if (!resetn)     seq_state <= SEQ_IDLE;
-        else if (pwrdn)  seq_state <= SEQ_IDLE;
-        else             seq_state <= seq_next;
+    state_e  state_q, state_d;
+
+    always_ff @(posedge clk or negedge resetn) begin : FSM_REG
+        if (!resetn)    state_q <= S_IDLE_WARM;
+        else            state_q <= state_d;
     end
 
-    always_comb begin : SEQ_TRANS
-        seq_next  = seq_state;
-        seq_start = 1'b0;
-        unique case (seq_state)
-            SEQ_IDLE: begin
-                if (sample_pulse) begin
-                    seq_start = 1'b1;
-                    seq_next  = SEQ_BUSY;
-                end
-            end
-            SEQ_BUSY: begin
-                seq_next = SEQ_HOLD;
-            end
-            SEQ_HOLD: begin
-                if (!sample_pulse)
-                    seq_next = SEQ_IDLE;
-            end
-            default: seq_next = SEQ_IDLE;
-        endcase
-    end
+    // Mode flag derived from state encoding: 0 = warmup, 1 = running.
+    logic  mode_run;
+    assign mode_run = state_q[0];
 
-    logic [PIPE_LATENCY-1:0]  pulse_dly;
+
+    logic  calc_en;
+    assign calc_en = (state_q == S_IDLE_WARM && sample_pulse) ||
+                     (state_q == S_IDLE_RUN  && sample_pulse);
+
+    logic [PIPE_LATENCY-1:0]  pulse_dly_q;
 
     always_ff @(posedge clk or negedge resetn) begin : PULSE_DELAY
-        if (!resetn)     pulse_dly <= '0;
-        else if (pwrdn)  pulse_dly <= '0;
-        else             pulse_dly <= {pulse_dly[PIPE_LATENCY-2:0], sample_pulse};
+        if (!resetn)    pulse_dly_q <= '0;
+        else            pulse_dly_q <= {pulse_dly_q[PIPE_LATENCY-2:0], calc_en};
     end
 
-    assign dout_pulse = pulse_dly[PIPE_LATENCY-1];
+    assign clk_out = pulse_dly_q[PIPE_LATENCY-1];
 
-    function automatic sval_t abs_s (input sval_t x);
-        abs_s = (x < 0) ? -x : x;
-    endfunction
 
-    sval_t v_meas;
+    buf_entry_t  buffer_q  [0:BUF_LEN-1];
+    buf_entry_t  buffer_d  [0:BUF_LEN-1];
+
+    logic  lockout_c;
+
+    assign lockout_c = (buffer_q[BUF_LEN-1].flag == ESTIMATED) &&
+                       (buffer_q[BUF_LEN-2].flag == ESTIMATED) &&
+                       (buffer_q[BUF_LEN-3].flag == ESTIMATED);
+
+    logic [9:0]  x_mag_c;
+    logic        x_sign_c;
+    sval_t       x_ext_c;
+    sval_t       v_meas_c;
 
     always_comb begin : INPUT_DECODE
-        sval_t cnt_ext;
-        cnt_ext = sval_t'({2'b00, cnt_in});
-        if (ovf_in)        v_meas = '0;
-        else if (sgn_in)   v_meas = -cnt_ext;
-        else               v_meas =  cnt_ext;
+        x_mag_c  = ovf_in ? 10'(CLIP_VAL) : cnt_in;
+        x_sign_c = ovf_in ? buffer_q[BUF_LEN-1].value[11] : sgn_in;
+        x_ext_c  = sval_t'({2'b00, x_mag_c});
+        v_meas_c = x_sign_c ? -x_ext_c : x_ext_c;
     end
 
-    buf_entry_t  buffer    [0:BUF_LEN-1];
-    buf_entry_t  new_entry;
+    logic signed [12:0]  delta_c;
+    sval_t               delta_div_c;
+    sval_t               expected_c;
 
-    logic lockout_c; // Detects predictor runaway
+    always_comb begin : PREDICT
+        delta_c   = $signed({buffer_q[BUF_LEN-1].value[11], buffer_q[BUF_LEN-1].value})
+                  - $signed({buffer_q[0].value[11],          buffer_q[0].value});
+        delta_div_c = sval_t'(delta_c >>> DELTA_SHIFT);
+        expected_c  = buffer_q[BUF_LEN-1].value + delta_div_c;
+    end
 
-    assign lockout_c = logic'(buffer[BUF_LEN-1].flag) & logic'(buffer[BUF_LEN-2].flag) & logic'(buffer[BUF_LEN-3].flag);
+    sval_t  diff_c;
+    sval_t  abs_diff_c;
+    logic   in_critical_c;
+    logic   is_outlier_c;
+    logic   use_expected_c;
 
-    warmup_state_e                       wm_state, wm_next;
-    logic [$clog2(WARMUP_SAMPLES+1):0]   sample_count;
+    always_comb begin : ZONE_DECISION
+        in_critical_c = (expected_c > -sval_t'(CRITICAL_RANGE)) &&
+                        (expected_c <  sval_t'(CRITICAL_RANGE));
+        diff_c        = v_meas_c - expected_c;
+        abs_diff_c    = diff_c[11] ? -diff_c : diff_c;
+        is_outlier_c  = (abs_diff_c > sval_t'(OUTLIER_THRESH));
 
-    always_ff @(posedge clk or negedge resetn) begin : WM_CNT
-        if (!resetn)
-            sample_count <= '0;
-        else if (pwrdn)
-            sample_count <= '0;
-        else if (seq_start) begin
-            // Reset count on lockout so re-warmup starts fresh
-            if (wm_state == RUNNING && lockout_c)
-                sample_count <= '0;
-            else if (wm_state == WARMUP)
-                sample_count <= sample_count + 1'b1;
+        // mode_run gates the prediction: during warmup, always pass v_meas.
+        use_expected_c = mode_run && in_critical_c && (is_outlier_c || ovf_in);
+    end
+
+    sval_t  out_val_c;
+    flag_e  out_flag_c;
+
+    always_comb begin : FINAL_MUX
+        if (use_expected_c) begin
+            out_val_c  = expected_c;
+            out_flag_c = ESTIMATED;
+        end
+        else begin
+            out_val_c  = v_meas_c;
+            out_flag_c = MEASURED;
         end
     end
 
-    always_ff @(posedge clk or negedge resetn) begin : WM_STATE_REG
-        if (!resetn)         wm_state <= WARMUP;
-        else if (pwrdn)      wm_state <= WARMUP;
-        else if (seq_start)  wm_state <= wm_next;
+
+    logic  commit_now_c;
+    assign commit_now_c = (state_q == S_COMMIT_WARM) || (state_q == S_COMMIT_RUN);
+
+    buf_entry_t  new_entry_c;
+
+    always_comb begin : NEW_ENTRY_BUILD
+        new_entry_c.value = out_val_c;
+        new_entry_c.flag  = out_flag_c;
     end
 
-    always_comb begin : WM_TRANS
-        wm_next = wm_state;
-        unique case (wm_state)
-            WARMUP:  if (sample_count >= WARMUP_SAMPLES[$bits(sample_count)-1:0])
-                         wm_next = RUNNING;
-            RUNNING: if (lockout_c)
-                         wm_next = WARMUP;        // soft re-warmup on predictor runaway
-                     else
-                         wm_next = RUNNING;
+    always_comb begin : BUF_NEXT
+        // Default: hold current values.
+        for (int i = 0; i < BUF_LEN; i++) begin
+            buffer_d[i] = buffer_q[i];
+        end
+
+        if (commit_now_c) begin
+            // Shift left, insert new entry at top.
+            for (int i = 0; i < BUF_LEN-1; i++) begin
+                buffer_d[i] = buffer_q[i+1];
+            end
+            buffer_d[BUF_LEN-1] = new_entry_c;
+            if ((state_q == S_COMMIT_RUN) && lockout_c) begin
+                for (int i = 0; i < BUF_LEN; i++) begin
+                    buffer_d[i].flag = ESTIMATED;
+                end
+            end
+        end
+    end
+
+    always_ff @(posedge clk or negedge resetn) begin : BUF_REG
+        if (!resetn) begin
+            for (int i = 0; i < BUF_LEN; i++) begin
+                buffer_q[i].value <= '0;
+                buffer_q[i].flag  <= ESTIMATED;
+            end
+        end else begin
+            buffer_q <= buffer_d;
+        end
+    end
+
+    logic  warmup_done_c;
+
+    assign warmup_done_c = ~(buffer_d[0].flag | buffer_d[1].flag |
+                             buffer_d[2].flag | buffer_d[3].flag);
+
+    always_comb begin : FSM_NEXT
+        state_d = state_q;
+        unique case (state_q)
+            S_IDLE_WARM:    state_d = sample_pulse  ? S_CALC_WARM   : S_IDLE_WARM;
+            S_CALC_WARM:    state_d = S_COMMIT_WARM;
+            S_COMMIT_WARM:  state_d = warmup_done_c ? S_HOLD_RUN    : S_HOLD_WARM;
+            S_HOLD_WARM:    state_d = sample_pulse  ? S_HOLD_WARM   : S_IDLE_WARM;
+            S_IDLE_RUN:     state_d = sample_pulse  ? S_CALC_RUN    : S_IDLE_RUN;
+            S_CALC_RUN:     state_d = S_COMMIT_RUN;
+            S_COMMIT_RUN:   state_d = lockout_c     ? S_HOLD_WARM   : S_HOLD_RUN;
+            S_HOLD_RUN:     state_d = sample_pulse  ? S_HOLD_RUN    : S_IDLE_RUN;
+            default:        state_d = S_IDLE_WARM;
         endcase
     end
 
-    logic signed [13:0]  delta_acc_c;
-    sval_t               avg_delta_c;
-    sval_t               v_est_c;
-    sval_t               v_last_c;
+    sval_t       out_abs_c;
+    logic [9:0]  out_mag_c;
+    logic        out_sgn_c;
 
-    always_comb begin : CALC_DELTA_AVG
-        delta_acc_c = '0;
-        delta_acc_c = signed'({{2{buffer[BUF_LEN-1].value[11]}}, buffer[BUF_LEN-1].value}) - 
-                      signed'({{2{buffer[0].value[11]}}, buffer[0].value});
-        
-        avg_delta_c = sval_t'(delta_acc_c >>> DELTA_SHIFT);
-    end
-
-    always_comb begin : CALC_PREDICTION
-        v_last_c = buffer[BUF_LEN-1].value;
-        v_est_c = sval_t'(signed'({{2{v_last_c[11]}}, v_last_c}) + signed'({{2{avg_delta_c[11]}}, avg_delta_c}));
-    end
-
-    sval_t          v_est_s2, v_last_s2, v_meas_s2;
-    logic           ovf_s2;
-    warmup_state_e  wm_state_s2;
-    logic           valid_s2;
-
-    always_ff @(posedge clk or negedge resetn) begin : STAGE1_REG
-        if (!resetn) begin
-            v_est_s2    <= '0;
-            v_last_s2   <= '0;
-            v_meas_s2   <= '0;
-            ovf_s2      <= 1'b0;
-            wm_state_s2 <= WARMUP;
-            valid_s2    <= 1'b0;
-        end
-        else if (pwrdn) begin
-            v_est_s2    <= '0;
-            v_last_s2   <= '0;
-            v_meas_s2   <= '0;
-            ovf_s2      <= 1'b0;
-            wm_state_s2 <= WARMUP;
-            valid_s2    <= 1'b0;
-        end
-        else begin
-            valid_s2 <= seq_start;
-            if (seq_start) begin
-                v_est_s2    <= v_est_c;
-                v_last_s2   <= v_last_c;
-                v_meas_s2   <= v_meas;
-                ovf_s2      <= ovf_in;
-                wm_state_s2 <= (wm_state == RUNNING && lockout_c) ? WARMUP : wm_state;
-            end
-        end
-    end
-
-    sval_t   abs_v_est_s2, abs_v_diff_s2,  v_diff_s2;
-    logic    in_critical_s2, in_fullscale_s2, is_outlier_s2;
-    sval_t   out_val_c;
-    flag_e   out_flag_c;
-
-
-    always_comb begin : ZONE_DECISION
-        abs_v_est_s2   = abs_s(v_est_s2);
-        v_diff_s2      = v_meas_s2 - v_est_s2;
-        abs_v_diff_s2  = abs_s(v_diff_s2);
-        
-        in_critical_s2  = (abs_v_est_s2  < sval_t'(CRITICAL_RANGE));
-        in_fullscale_s2 = (abs_v_est_s2 >= sval_t'(FULL_SCALE_HI));
-        is_outlier_s2   = (abs_v_diff_s2 > sval_t'(OUTLIER_THRESH_NORM));
-    end
-
-    always_comb begin : DECISION_LOGIC
-        out_val_c  = v_meas_s2;
-        out_flag_c = MEASURED;
-        if (wm_state_s2 == WARMUP) begin
-				if (ovf_s2 && in_fullscale_s2) begin
-                    out_val_c  = (v_last_s2 < 0) ? -sval_t'(CLIP_VAL)
-                                                 :  sval_t'(CLIP_VAL);
-                    out_flag_c = MEASURED;
-                end else begin
-					out_val_c  = v_meas_s2;
-					out_flag_c = MEASURED;
-				end
-        end
-        else begin
-			if(in_critical_s2) begin
-				if (is_outlier_s2 || ovf_s2) begin
-					out_val_c  = v_est_s2;
-					out_flag_c = ESTIMATED;
-				end
-				else begin
-					out_val_c  = v_meas_s2;
-					out_flag_c = MEASURED;
-				end
-			end else begin
-				if (ovf_s2 && in_fullscale_s2) begin
-                    out_val_c  = (v_last_s2 < 0) ? -sval_t'(CLIP_VAL)
-                                                 :  sval_t'(CLIP_VAL);
-                    out_flag_c = MEASURED;
-                end
-                else begin
-					out_val_c  = v_meas_s2;
-					out_flag_c = MEASURED;
-                end
-            end
-		end
-	end
-
-    always_comb begin : BUF_PACK
-        new_entry.value = out_val_c;
-        new_entry.flag  = out_flag_c;
-    end
-
-    always_ff @(posedge clk or negedge resetn) begin : BUF_SHIFT
-        if (!resetn) begin
-            for (int i = 0; i < BUF_LEN; i++) begin
-                buffer[i].value <= '0;
-                buffer[i].flag  <= MEASURED;
-            end
-        end
-        else if (pwrdn) begin
-            for (int i = 0; i < BUF_LEN; i++) begin
-                buffer[i].value <= '0;
-                buffer[i].flag  <= MEASURED;
-            end
-        end
-        else if (valid_s2) begin
-            for (int i = 0; i < BUF_LEN-1; i++) begin
-                buffer[i] <= buffer[i+1];
-            end
-            buffer[BUF_LEN-1] <= new_entry;
-        end
-    end
-
-    sval_t   out_val_s3;
-    flag_e   out_flag_s3;
-
-    always_ff @(posedge clk or negedge resetn) begin : STAGE2_REG
-        if (!resetn) begin
-            out_val_s3  <= '0;
-            out_flag_s3 <= MEASURED;
-        end
-        else if (pwrdn) begin
-            out_val_s3  <= '0;
-            out_flag_s3 <= MEASURED;
-        end
-        else if (valid_s2) begin
-            out_val_s3  <= out_val_c;
-            out_flag_s3 <= out_flag_c;
-        end
-    end
-
-    logic [9:0]  dout_c;
-    logic        dout_sgn_c;
-    logic        flag_estimated_c;
-
-    always_comb begin : OUTPUT_CONVERT
-        dout_sgn_c       = out_val_s3[11];
-        dout_c           = (out_val_s3 < 0)? 10'(-out_val_s3) : 10'(out_val_s3);
-        flag_estimated_c = (out_flag_s3 == ESTIMATED);
+    always_comb begin : OUTPUT_FORMAT
+        out_sgn_c = out_val_c[11];
+        out_abs_c = out_val_c[11] ? -out_val_c : out_val_c;
+        if (out_abs_c > sval_t'(CLIP_VAL))  out_mag_c = 10'(CLIP_VAL);
+        else                                out_mag_c = out_abs_c[9:0];
     end
 
     always_ff @(posedge clk or negedge resetn) begin : OUTPUT_REG
@@ -307,15 +210,10 @@ module error_handler #(
             dout_sgn       <= 1'b0;
             flag_estimated <= 1'b0;
         end
-        else if (pwrdn) begin
-            dout           <= '0;
-            dout_sgn       <= 1'b0;
-            flag_estimated <= 1'b0;
-        end
-        else begin
-            dout           <= dout_c;
-            dout_sgn       <= dout_sgn_c;
-            flag_estimated <= flag_estimated_c;
+        else if (commit_now_c) begin
+            dout           <= out_mag_c;
+            dout_sgn       <= out_sgn_c;
+            flag_estimated <= (out_flag_c == ESTIMATED);
         end
     end
 
